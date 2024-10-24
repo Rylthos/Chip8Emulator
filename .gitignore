@@ -1,0 +1,5 @@
+.cache/*
+.direnv/*
+.envrc
+build/*
+*.sh
