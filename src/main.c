@@ -11,12 +11,12 @@
 #include "sprites.h"
 
 // #define DEBUG
-#define DISPLAY
 
 #ifdef DEBUG
 #define DEBUG_MSG(...) printf(__VA_ARGS__)
 #else
 #define DEBUG_MSG(msg, ...)
+#define DISPLAY
 #endif
 
 #define CHIP8_DISPLAY_WIDTH 64
@@ -24,29 +24,114 @@
 
 #define RENDER_CHARACTER "@@"
 
+#define CHIP8_STACK_SIZE 16
+#define CHIP8_MEMORY_SIZE 4096
+#define CHIP8_REGISTER_SIZE 16
+
 struct chip8_memory {
     uint16_t pc;
     uint16_t sp;
     int16_t i;
 
-    uint8_t registers[16];
-    uint16_t stack[16];
-    uint8_t memory[4096];
+    uint8_t registers[CHIP8_REGISTER_SIZE];
+    uint16_t stack[CHIP8_STACK_SIZE];
+    uint8_t memory[CHIP8_MEMORY_SIZE];
 
     uint8_t display_memory[CHIP8_DISPLAY_WIDTH * CHIP8_DISPLAY_HEIGHT];
 
     uint8_t delay_timer;
     uint8_t sound_timer;
 };
+typedef struct chip8_memory* chip8_memory_T;
 
-FILE* read_rom(char* file)
+struct timer {
+    struct timeval current;
+    struct timeval previous;
+};
+typedef struct timer timer_T;
+
+uint8_t update_timer(timer_T* timer, float clock)
 {
-    FILE* ptr;
-    ptr = fopen(file, "rb");
-    return ptr;
+    gettimeofday(&(timer->current), NULL);
+    if (timer->current.tv_usec < timer->previous.tv_usec)
+    {
+        timer->previous = timer->current;
+        return 1;
+    }
+
+    if (timer->current.tv_sec > timer->previous.tv_sec)
+    {
+        timer->previous = timer->current;
+        return 1;
+    }
+
+    if ((timer->current.tv_usec - timer->previous.tv_usec) > clock)
+    {
+        timer->previous = timer->current;
+        return 1;
+    }
+
+    return 0;
+}
+
+float get_timer_delta(timer_T* timer)
+{
+    return (timer->current.tv_usec - timer->previous.tv_usec) / 1000000.0;
 }
 
 int nibbleToSprite(uint8_t v) { return 5 * (v & 0xF); }
+
+chip8_memory_T init_memory()
+{
+    chip8_memory_T memory = (chip8_memory_T)malloc(sizeof(struct chip8_memory));
+
+    memory->pc = 0x200;
+    memory->sp = 0;
+
+    memset(memory->memory, 0, CHIP8_MEMORY_SIZE);
+    for (int i = 0; i < 16; i++)
+    {
+        int location = nibbleToSprite(i);
+        for (int j = 0; j < 5; j++)
+        {
+            memory->memory[location + j] = fonts[i][j];
+        }
+    }
+
+    memset(memory->stack, 0, CHIP8_STACK_SIZE);
+    memset(memory->display_memory, 0, CHIP8_DISPLAY_HEIGHT * CHIP8_DISPLAY_WIDTH);
+
+    return memory;
+}
+
+uint8_t* read_rom(char* file, int* byte_count)
+{
+    FILE* ptr;
+    ptr = fopen(file, "rb");
+
+    fseek(ptr, 0, SEEK_END);
+    uint32_t rom_size = ftell(ptr);
+    fseek(ptr, 0, SEEK_SET);
+
+    uint8_t* bytes = (uint8_t*)malloc(sizeof(uint8_t) * rom_size);
+
+    *byte_count = fread(bytes, sizeof(uint8_t), rom_size, ptr);
+    fclose(ptr);
+
+    return bytes;
+}
+
+void advance_pc(chip8_memory_T memory) { memory->pc += 2; }
+
+uint16_t get_next_instruction(chip8_memory_T memory)
+{
+    uint16_t instruction = 0;
+    instruction |= (memory->memory[memory->pc] << 8);
+    instruction |= (memory->memory[memory->pc + 1]);
+    advance_pc(memory);
+
+    return instruction;
+}
 
 uint8_t characterToMapping(uint8_t c)
 {
@@ -128,39 +213,43 @@ void execute(uint16_t instruction, struct chip8_memory* memory)
     uint16_t kk = (instruction) & 0x00FF;
     uint16_t nnn = (instruction) & 0x0FFF;
 
-    DEBUG_MSG("0x%04X, PC: 0x%04X\n", instruction, memory->pc);
-
+    DEBUG_MSG("0x%04X | ", instruction);
     switch (opcode)
     {
     case 0:
         {
             if (nnn == 0x0E0) // 00E0 - Display
             {
+                DEBUG_MSG("00E0 | Clear Screen\n");
+
                 memset(memory->display_memory, 0, 64 * 32);
-                break;
             }
             else if (nnn == 0x0EE) // 00EE -- RETURN
             {
+                DEBUG_MSG("00EE | RETURN 0x%03X\n", memory->stack[memory->sp]);
+
                 memory->pc = memory->stack[memory->sp];
                 memory->sp--;
-                break;
             }
-
-            DEBUG_MSG("Invalid operation : %X\n", instruction);
-            exit(-1);
+            else
+            {
+                DEBUG_MSG("Invalid operation\n");
+                exit(-1);
+            }
             break;
         }
 
     case 1: // 1NNN - Goto NNN
         {
-            DEBUG_MSG("Jump to 0x%X\n", nnn);
+            DEBUG_MSG("1NNN | GOTO 0x%03X\n", nnn);
             memory->pc = nnn;
             break;
         }
 
     case 2: // 2NNN - Call NNN
         {
-            DEBUG_MSG("Call 0x%X\n", nnn);
+            DEBUG_MSG("2NNN | Call 0x%03X\n", nnn);
+
             memory->sp++;
             memory->stack[memory->sp] = memory->pc;
             memory->pc = nnn;
@@ -169,29 +258,39 @@ void execute(uint16_t instruction, struct chip8_memory* memory)
 
     case 3: // 3XNN - if (Vx == NN)
         {
-            if (memory->registers[X] == kk) memory->pc += 2;
+            DEBUG_MSG("3XNN | V[0x%01X] == 0x%02X\n", X, kk);
+
+            if (memory->registers[X] == kk) advance_pc(memory);
             break;
         }
 
     case 4: // 4XNN - if (Vx != NN)
         {
-            if (memory->registers[X] != kk) memory->pc += 2;
+            DEBUG_MSG("4XNN | V[0x%01X] != 0x%02X\n", X, kk);
+
+            if (memory->registers[X] != kk) advance_pc(memory);
             break;
         }
 
     case 5: // 5XY0 - if (Vx == Vy)
         {
-            if (memory->registers[X] == memory->registers[Y]) memory->pc += 2;
+            DEBUG_MSG("5XY0 | V[0x%01X] != V[0x%01X]\n", X, Y);
+
+            if (memory->registers[X] == memory->registers[Y]) advance_pc(memory);
             break;
         }
 
     case 6: // 6XNN - Vx = NN
         {
+            DEBUG_MSG("6XNN | V[0x%01X] = 0x%02X\n", X, kk);
+
             memory->registers[X] = kk;
             break;
         }
-    case 7: // 7xNN - Vx += NN
+    case 7: // 7XNN - Vx += NN
         {
+            DEBUG_MSG("7XNN | V[0x%01X] += 0x%02X\n", X, kk);
+
             memory->registers[X] += kk;
             break;
         }
@@ -201,22 +300,32 @@ void execute(uint16_t instruction, struct chip8_memory* memory)
             switch (N)
             {
             case 0: // 8XY0 - Vx = Vy
+                DEBUG_MSG("8XY0 | V[0x%01X] = V[0x%01X]\n", X, Y);
+
                 memory->registers[X] = memory->registers[Y];
                 break;
             case 1: // 8XY1 - Vx |= Vy
+                DEBUG_MSG("8XY1 | V[0x%01X] |= V[0x%01X]\n", X, Y);
+
                 memory->registers[X] |= memory->registers[Y];
                 memory->registers[0xF] = 0;
                 break;
-            case 2: // 8XY2 - Vx &= V1100y
+            case 2: // 8XY2 - Vx &= Vy
+                DEBUG_MSG("8XY2 | V[0x%01X] &= V[0x%01X]\n", X, Y);
+
                 memory->registers[X] &= memory->registers[Y];
                 memory->registers[0xF] = 0;
                 break;
             case 3: // 8XY3 - Vx ^= Vy
+                DEBUG_MSG("8XY3 | V[0x%01X] ^= V[0x%01X]\n", X, Y);
+
                 memory->registers[X] ^= memory->registers[Y];
                 memory->registers[0xF] = 0;
                 break;
             case 4: // 8XY4 - Vx += Vy
                 {
+                    DEBUG_MSG("8XY4 | V[0x%01X] += V[0x%01X]\n", X, Y);
+
                     int16_t before = memory->registers[X];
                     before += memory->registers[Y];
                     memory->registers[X] = before & 0xFF;
@@ -225,6 +334,8 @@ void execute(uint16_t instruction, struct chip8_memory* memory)
                 }
             case 5: // 8XY5 - Vx -= Vy
                 {
+                    DEBUG_MSG("8XY5 | V[0x%01X] -= V[0x%01X]\n", X, Y);
+
                     uint8_t rv = (memory->registers[X] >= memory->registers[Y]);
                     memory->registers[X] -= memory->registers[Y];
                     memory->registers[0xF] = rv;
@@ -232,6 +343,8 @@ void execute(uint16_t instruction, struct chip8_memory* memory)
                 }
             case 6: // 8XY6 - Vx >>= 1
                 {
+                    DEBUG_MSG("8XY6 | V[0x%01X] >>= 1\n", X);
+
                     uint8_t rv = (memory->registers[X] & 0x1);
                     memory->registers[X] >>= 1;
                     memory->registers[0xF] = rv;
@@ -239,6 +352,8 @@ void execute(uint16_t instruction, struct chip8_memory* memory)
                 }
             case 7: // 8XY7 - Vx = Vy - Vx
                 {
+                    DEBUG_MSG("8XY7 | V[0x%01X] = V[0x%01X] - V[0x%01X]\n", X, Y, X);
+
                     uint8_t rv = (memory->registers[Y] >= memory->registers[X]);
                     memory->registers[X] = memory->registers[Y] - memory->registers[X];
                     memory->registers[0xF] = rv;
@@ -247,37 +362,54 @@ void execute(uint16_t instruction, struct chip8_memory* memory)
 
             case 0xE: // 8XYE - Vx = vX << 1
                 {
+                    DEBUG_MSG("8XYE | V[0x%01X] <<= 1\n", X);
+
                     uint8_t rv = (memory->registers[X] >> 7) & 1;
                     memory->registers[X] <<= 1;
                     memory->registers[0xF] = rv;
                     break;
                 }
             default:
-                printf("Invalid operation: %x\n", instruction);
+                DEBUG_MSG("Invalid operation\n");
+                exit(-1);
+                break;
             }
             break;
         }
 
-    case 9:
+    case 9: // 9XY0 - SKIP VX != VY
         {
-            if (memory->registers[X] != memory->registers[Y]) memory->pc += 2;
+            DEBUG_MSG("9XY0 | SKIP V[0x%01X] != V[0x%01X]\n", X, Y);
+
+            if (memory->registers[X] != memory->registers[Y]) advance_pc(memory);
             break;
         }
 
-    case 0xA:
-        memory->i = nnn;
-        break;
-
-    case 0xB:
-        memory->pc = nnn + memory->registers[0];
-        break;
-
-    case 0xC:
-        memory->registers[X] = (rand() % 0xFF) & kk;
-        break;
-
-    case 0xD:
+    case 0xA: // ANNN - I = nnn
         {
+            DEBUG_MSG("ANNN | I = 0x%03X\n", nnn);
+            memory->i = nnn;
+            break;
+        }
+
+    case 0xB: // BNNN - JUMP nnn + V0
+        {
+            DEBUG_MSG("ANNN | JUMP 0x%03X + V[0]\n", nnn);
+            memory->pc = nnn + memory->registers[0];
+            break;
+        }
+
+    case 0xC: // CXNN - Random NN
+        {
+            DEBUG_MSG("CXNN | V[0x%01X] = RAND & 0x%02X\n", X, kk);
+            memory->registers[X] = (rand() % 0xFF) & kk;
+            break;
+        }
+
+    case 0xD: // DXYN - Draw Vx Vy n
+        {
+            DEBUG_MSG("DXYN | DRAW V[0x%01X] V[0x%01X] 0x%01x\n", X, Y, N);
+
             int x = memory->registers[X] % CHIP8_DISPLAY_WIDTH;
             int y = memory->registers[Y] % CHIP8_DISPLAY_HEIGHT;
             memory->registers[0xF] = 0;
@@ -307,24 +439,29 @@ void execute(uint16_t instruction, struct chip8_memory* memory)
         {
             switch (kk)
             {
-            case 0x9E:
+            case 0x9E: // EX9E - SKIP KEY = Vx
                 {
+                    DEBUG_MSG("EX9E | SKIP KEY = V[0x%01X]\n", X);
+
                     char c = currentKeyPress();
                     if (c == 0x10) break;
 
-                    if (memory->registers[X] == c) memory->pc += 2;
+                    if (memory->registers[X] == c) advance_pc(memory);
                     break;
                 }
-            case 0xA1:
+            case 0xA1: // EXA1 - SKIP KEY = Vx
                 {
+                    DEBUG_MSG("EXA1 | SKIP KEY != V[0x%01X]\n", X);
+
                     char c = currentKeyPress();
                     if (c == 0x10) break;
 
-                    if (memory->registers[X] != c) memory->pc += 2;
+                    if (memory->registers[X] != c) advance_pc(memory);
                     break;
                 }
             default:
-                printf("Invalid instruction: %x\n", instruction);
+                DEBUG_MSG("Invalid Instruction\n");
+                exit(-1);
             }
             break;
         }
@@ -333,11 +470,15 @@ void execute(uint16_t instruction, struct chip8_memory* memory)
         {
             switch (kk)
             {
-            case 0x07:
+            case 0x07: // FX07 - Vx = DT
+                DEBUG_MSG("FX07 | V[0x%01X] = DT\n", X);
+
                 memory->registers[X] = memory->delay_timer;
                 break;
-            case 0x0A:
+            case 0x0A: // FX0A - Vx = KEY
                 {
+                    DEBUG_MSG("FX0A | V[0x%01X] = KEY\n", X);
+
                     char c = currentKeyPress();
                     if (c == 0x10)
                     {
@@ -349,43 +490,58 @@ void execute(uint16_t instruction, struct chip8_memory* memory)
                     }
                     break;
                 }
-            case 0x15:
+            case 0x15: // FX15 - DT = Vx
+                DEBUG_MSG("FX15 | DT = V[0x%01X]\n", X);
+
                 memory->delay_timer = memory->registers[X];
                 break;
-            case 0x18:
+            case 0x18: // FX18 - ST = Vx
+                DEBUG_MSG("FX0A | ST = V[0x%01X]\n", X);
+
                 memory->sound_timer = memory->registers[X];
                 break;
-            case 0x1E:
+            case 0x1E: // FX1E - I += Vx
+                DEBUG_MSG("FX1E | I += V[0x%01X]\n", X);
+
                 memory->i = memory->i + memory->registers[X];
                 break;
-            case 0x29:
+            case 0x29: // FX29 - I = MEM DIGIT Vx
+                DEBUG_MSG("FX29 | I = MEM DIGIT V[0x%01X]\n", X);
+
                 memory->i = nibbleToSprite(memory->registers[X]);
                 break;
-            case 0x33:
+            case 0x33: // FX33 - I, I+1, I+2 = BCD Vx
+                DEBUG_MSG("FX33 | I, I+1, I+2 = V[0x%01X]\n", X);
+
                 memory->memory[memory->i] = memory->registers[X] / 100;
                 memory->memory[memory->i + 1] = (memory->registers[X] / 10) % 10;
                 memory->memory[memory->i + 2] = (memory->registers[X] / 1) % 10;
                 break;
-            case 0x55:
+            case 0x55: // FX55 - STR Vx
+                DEBUG_MSG("FX55 | STR V[0x%01X]\n", X);
+
                 for (int i = 0; i <= X; i++)
                 {
                     memory->memory[memory->i + i] = memory->registers[i];
                 }
                 break;
-            case 0x65:
+            case 0x65: // FX65 - LD Vx
+                DEBUG_MSG("FX65 | LD V[0x%01X]\n", X);
+
                 for (int i = 0; i <= X; i++)
                 {
                     memory->registers[i] = memory->memory[memory->i + i];
                 }
                 break;
             default:
-                printf("Invalid opcode: %x\n", instruction);
+                DEBUG_MSG("Invalid Instruction\n");
+                exit(-1);
                 break;
             }
             break;
         }
     default:
-        printf("Invalid opcode: %x\n", instruction);
+        DEBUG_MSG("Invalid Instruction\n");
         exit(-1);
         break;
     }
@@ -437,7 +593,7 @@ void printDisplayMemory(struct chip8_memory* memory)
     }
 }
 
-void renderDisplay(struct chip8_memory* memory)
+void render_display(struct chip8_memory* memory)
 {
 #ifdef DISPLAY
     const uint8_t yOffset = 1;
@@ -462,96 +618,64 @@ void renderDisplay(struct chip8_memory* memory)
             }
         }
     }
-    refresh();
 #endif
+}
+
+void update(chip8_memory_T memory)
+{
+    if (memory->sound_timer)
+    {
+        fprintf(stdin, "%c", '\007');
+    }
+
+    memory->sound_timer = (memory->sound_timer != 0) ? memory->sound_timer - 1 : 0;
+    memory->delay_timer = (memory->delay_timer != 0) ? memory->delay_timer - 1 : 0;
+
+    render_display(memory);
 }
 
 void mainLoop(uint8_t* bytes, int byteCount)
 {
-    struct timeval current;
-    struct timeval previous;
+    timer_T game_timer;
+    timer_T display_timer;
 
-    struct timeval timer_current;
-    struct timeval timer_previous;
+    gettimeofday(&game_timer.previous, NULL);
+    gettimeofday(&display_timer.previous, NULL);
 
-    gettimeofday(&previous, NULL);
-    gettimeofday(&timer_previous, NULL);
+    const float game_clk = 1000000. / 1024.;
+    const float display_clk = 1000000. / 60.;
 
-    float wait = 1000000. / 1024.;
-    float timer_wait = 1000000. / 60.;
+    chip8_memory_T memory = init_memory();
 
-    struct chip8_memory memory;
-    memory.pc = 0x200;
-    memory.sp = 0;
-
-    for (int i = 0; i < 16; i++)
-    {
-        int location = nibbleToSprite(i);
-        for (int j = 0; j < 5; j++)
-        {
-            memory.memory[location + j] = fonts[i][j];
-        }
-    }
-
-    memset(memory.memory, 0, 4096);
-    memcpy(memory.memory + 0x200, bytes, byteCount);
-
-    memset(memory.stack, 0, 16);
-    memset(memory.display_memory, 0, CHIP8_DISPLAY_WIDTH * CHIP8_DISPLAY_HEIGHT);
-
-    memory.memory[0x1ff] = 3;
+    memcpy(memory->memory + 0x200, bytes, byteCount);
 
     do
     {
-        gettimeofday(&current, NULL);
-        gettimeofday(&timer_current, NULL);
+        float instruction_time = get_timer_delta(&game_timer);
+        float display_time = get_timer_delta(&display_timer);
 
-        if (current.tv_usec < previous.tv_usec)
-        {
-            previous = current;
-        }
+        uint8_t update_game = update_timer(&game_timer, game_clk);
+        uint8_t update_display = update_timer(&display_timer, display_clk);
 
-        if (timer_current.tv_usec < timer_previous.tv_usec)
-        {
-            timer_previous = timer_current;
-        }
-
-        if (current.tv_usec - previous.tv_usec < wait)
+        if (!update_game)
         {
             continue;
         }
-        int64_t frame_time = current.tv_usec - previous.tv_usec;
-        previous = current;
 
-        if (timer_current.tv_usec - timer_previous.tv_usec > timer_wait)
+        if (update_display)
         {
-            float diff = timer_current.tv_usec - timer_previous.tv_usec;
-            float diff_seconds = diff / 1000000.0;
-
-            if (memory.sound_timer)
-            {
-                fprintf(stdin, "%c", '\007');
-            }
-
-            timer_previous = timer_current;
-            memory.sound_timer = (memory.sound_timer != 0) ? memory.sound_timer - 1 : 0;
-            memory.delay_timer = (memory.delay_timer != 0) ? memory.delay_timer - 1 : 0;
-
+            update(memory);
             mvprintw(0, 0,
                      "Instruction Time: %.6f | IPS: %.2f | Frame Time: %.6f | FPS: "
                      "%.2f | %02X      ",
-                     frame_time / 1000000.0, 1000000.0 / frame_time, diff_seconds, 1 / diff_seconds,
+                     instruction_time, 1. / instruction_time, display_time, 1. / display_time,
                      currentKeyPress());
-            renderDisplay(&memory);
+
+            refresh();
         }
 
-        uint16_t currentInstruction = 0;
-        currentInstruction |= (memory.memory[memory.pc] << 8);
-        currentInstruction |= (memory.memory[memory.pc + 1]);
-        // uint16_t currentInstruction = memory.memory[memory.pc];
-
-        memory.pc += 2;
-        execute(currentInstruction, &memory);
+        uint16_t next_instruction = get_next_instruction(memory);
+        execute(next_instruction, memory);
 
     } while (1);
 }
@@ -565,18 +689,8 @@ int main(int argc, char** argv)
     }
 
     char* rom_location = argv[1];
-    FILE* rom = read_rom(rom_location);
-
-    fseek(rom, 0, SEEK_END);
-    uint32_t romSize = ftell(rom);
-    fseek(rom, 0, SEEK_SET);
-
-    printf("Rom Size: %u\n", romSize);
-
-    uint8_t* bytes = (uint8_t*)malloc(sizeof(uint8_t) * romSize);
-
-    int byteCount = fread(bytes, sizeof(uint8_t), romSize, rom);
-    fclose(rom);
+    int byte_count;
+    uint8_t* bytes = read_rom(rom_location, &byte_count);
 
 #ifdef DISPLAY
     initscr();
@@ -584,7 +698,8 @@ int main(int argc, char** argv)
     nodelay(stdscr, 1);
     refresh();
 #endif
-    mainLoop(bytes, byteCount);
+
+    mainLoop(bytes, byte_count);
 
     free(bytes);
 
