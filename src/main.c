@@ -4,7 +4,7 @@
 #include <string.h>
 
 #include <sys/select.h>
-#include <sys/time.h>
+#include <time.h>
 
 #include <curses.h>
 
@@ -45,28 +45,35 @@ struct chip8_memory {
 typedef struct chip8_memory* chip8_memory_T;
 
 struct timer {
-    struct timeval current;
-    struct timeval previous;
+    struct timespec current;
+    struct timespec previous;
 };
 typedef struct timer timer_T;
 
+void init_timer(timer_T* timer)
+{
+    clock_gettime(CLOCK_MONOTONIC, &timer->previous);
+    clock_gettime(CLOCK_MONOTONIC, &timer->current);
+}
+
+uint64_t get_timer_elapsed(timer_T* timer)
+{
+    return ((timer->current.tv_sec - timer->previous.tv_sec) * 1000000) +
+           ((timer->current.tv_nsec - timer->previous.tv_nsec) / 1000);
+}
+
 uint8_t update_timer(timer_T* timer, float clock)
 {
-    gettimeofday(&(timer->current), NULL);
-    if (timer->current.tv_usec < timer->previous.tv_usec)
-    {
-        timer->previous = timer->current;
-        return 1;
-    }
+    clock_gettime(CLOCK_MONOTONIC, &timer->current);
+    // gettimeofday(&(timer->current), NULL);
+    uint64_t elapsed = get_timer_elapsed(timer);
+    DEBUG_MSG("TIMER: %4ld : CLOCK %4.4f : current : %ld, %ld | previous : %ld, %ld\n", elapsed,
+              clock, timer->current.tv_sec, timer->current.tv_nsec, timer->previous.tv_sec,
+              timer->previous.tv_nsec);
 
-    if (timer->current.tv_sec > timer->previous.tv_sec)
+    if (elapsed > clock)
     {
-        timer->previous = timer->current;
-        return 1;
-    }
-
-    if ((timer->current.tv_usec - timer->previous.tv_usec) > clock)
-    {
+        DEBUG_MSG("ELAPSED\n");
         timer->previous = timer->current;
         return 1;
     }
@@ -74,10 +81,7 @@ uint8_t update_timer(timer_T* timer, float clock)
     return 0;
 }
 
-float get_timer_delta(timer_T* timer)
-{
-    return (timer->current.tv_usec - timer->previous.tv_usec) / 1000000.0;
-}
+float get_timer_delta(timer_T* timer) { return get_timer_elapsed(timer) / 1000000.0; }
 
 int nibbleToSprite(uint8_t v) { return 5 * (v & 0xF); }
 
@@ -482,7 +486,7 @@ void execute(uint16_t instruction, struct chip8_memory* memory)
                     char c = currentKeyPress();
                     if (c == 0x10)
                     {
-                        memory->pc--;
+                        memory->pc -= 2;
                     }
                     else
                     {
@@ -602,10 +606,6 @@ void render_display(struct chip8_memory* memory)
         for (int x = 0; x < CHIP8_DISPLAY_WIDTH; x++)
         {
             int renderY = y + yOffset;
-            move(renderY, x * 2 + 1);
-            delch();
-            move(renderY, x * 2);
-            delch();
 
             int index = y * CHIP8_DISPLAY_WIDTH + x;
             if (memory->display_memory[index])
@@ -639,11 +639,11 @@ void mainLoop(uint8_t* bytes, int byteCount)
     timer_T game_timer;
     timer_T display_timer;
 
-    gettimeofday(&game_timer.previous, NULL);
-    gettimeofday(&display_timer.previous, NULL);
-
     const float game_clk = 1000000. / 1024.;
     const float display_clk = 1000000. / 60.;
+
+    init_timer(&game_timer);
+    init_timer(&display_timer);
 
     chip8_memory_T memory = init_memory();
 
@@ -657,13 +657,10 @@ void mainLoop(uint8_t* bytes, int byteCount)
         uint8_t update_game = update_timer(&game_timer, game_clk);
         uint8_t update_display = update_timer(&display_timer, display_clk);
 
-        if (!update_game)
-        {
-            continue;
-        }
-
         if (update_display)
         {
+            DEBUG_MSG("DISPLAY\n");
+
             update(memory);
             mvprintw(0, 0,
                      "Instruction Time: %.6f | IPS: %.2f | Frame Time: %.6f | FPS: "
@@ -674,9 +671,12 @@ void mainLoop(uint8_t* bytes, int byteCount)
             refresh();
         }
 
-        uint16_t next_instruction = get_next_instruction(memory);
-        execute(next_instruction, memory);
-
+        if (update_game)
+        {
+            DEBUG_MSG("FRAME\n");
+            uint16_t next_instruction = get_next_instruction(memory);
+            execute(next_instruction, memory);
+        }
     } while (1);
 }
 
